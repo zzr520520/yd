@@ -1,0 +1,40 @@
+name: Build AntiDetection dylib
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    # GitHub 最新的 macOS 机器（自带 Xcode 与 iphoneos SDK）
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Compile dylib (arm64)
+        run: |
+          xcrun --sdk iphoneos clang -dynamiclib -arch arm64 \
+            -miphoneos-version-min=13.0 -Os \
+            AntiDetection/AntiDetection.m AntiDetection/fishhook.c \
+            -framework Foundation \
+            -o libMediaUtility.dylib
+          echo "--- output ---"
+          file libMediaUtility.dylib
+
+      - name: Strip & ad-hoc sign
+        run: |
+          strip -x libMediaUtility.dylib
+          codesign -s - libMediaUtility.dylib
+          codesign -dv libMediaUtility.dylib || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libMediaUtility
+          path: libMediaUtility.dylib
