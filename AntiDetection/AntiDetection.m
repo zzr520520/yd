@@ -2,6 +2,7 @@
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
 #import <objc/runtime.h>
+#import <dispatch/dispatch.h>
 #include "fishhook.h"
 
 #pragma mark - Original function pointers
@@ -64,13 +65,33 @@ static const char *custom_dyld_get_image_name(uint32_t image_index) {
 
 #pragma mark - Multi-open spoof: Hook NSBundle bundleIdentifier
 
+// 缓存 mainBundle 指针，避免在 hook 内调用 [NSBundle mainBundle] 触发递归
+static NSBundle *sMainBundle = nil;
+
 // 强制主 Bundle 返回原版标识
 static NSString *custom_bundleIdentifier(id self, SEL _cmd) {
-    // 只劫持 mainBundle，避免影响系统框架
-    if (self == [NSBundle mainBundle]) {
-        return kSpoofedBundleIdentifier;
+    // 重入保护：[NSBundle mainBundle] 内部可能回调 bundleIdentifier，递归会导致栈溢出/OOM
+    static __thread BOOL sInHook = NO;
+    if (sInHook) {
+        return orig_bundleIdentifier(self, _cmd);
     }
-    return orig_bundleIdentifier(self, _cmd);
+    sInHook = YES;
+    NSString *result;
+    @try {
+        // 懒初始化缓存指针（受 sInHook 保护，[NSBundle mainBundle] 若递归会被上面拦截走原实现）
+        if (sMainBundle == nil) {
+            sMainBundle = [NSBundle mainBundle];
+        }
+        // 纯指针比较，无 Objective-C 方法派发，零递归风险
+        if (self == sMainBundle) {
+            result = kSpoofedBundleIdentifier;
+        } else {
+            result = orig_bundleIdentifier(self, _cmd);
+        }
+    } @finally {
+        sInHook = NO;
+    }
+    return result;
 }
 
 #pragma mark - Signature/provisioning intercept: Hook open/read of embedded.mobileprovision
@@ -116,12 +137,17 @@ static void AntiDetectionInit(void) {
         }, 3);
 
         // 2. Method Swizzling: 劫持 NSBundle -bundleIdentifier
-        Method m = class_getInstanceMethod([NSBundle class], @selector(bundleIdentifier));
-        if (m != NULL) {
-            orig_bundleIdentifier = (NSString *(*)(id, SEL))method_getImplementation(m);
-            method_setImplementation(m, (IMP)custom_bundleIdentifier);
-        } else {
-            NSLog(@"[AntiDetect] WARNING: NSBundle.bundleIdentifier method not found");
-        }
+        //    延迟到主 runloop 启动后执行，确保 Foundation/UIKit 完全就绪，避免 constructor 时机过早崩溃
+        //    用 dispatch_async（下一个主循环）而非固定 0.5s：既保证就绪又尽量早，避免错过 rapidauth
+        dispatch_async(dispatch_get_main_queue(), ^{
+            Method m = class_getInstanceMethod([NSBundle class], @selector(bundleIdentifier));
+            if (m != NULL) {
+                orig_bundleIdentifier = (NSString *(*)(id, SEL))method_getImplementation(m);
+                method_setImplementation(m, (IMP)custom_bundleIdentifier);
+                NSLog(@"[AntiDetect] NSBundle.bundleIdentifier swizzle installed");
+            } else {
+                NSLog(@"[AntiDetect] WARNING: NSBundle.bundleIdentifier method not found");
+            }
+        });
     }
 }
